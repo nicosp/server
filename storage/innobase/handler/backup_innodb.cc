@@ -1672,54 +1672,12 @@ private:
         my_error(ER_CANT_CREATE_FILE, MYF(0), name, EEXIST);
         res= -1;
       }
-#ifdef _WIN32
-      else if (sink.stream == sink.NO_STREAM)
-      {
-        for (;;)
-        {
-          if ((res= backup(target, sink, node, name, start, limit)))
-            break;
-          fil_node_t *next= UT_LIST_GET_NEXT(chain, node);
-          if (!next)
-            break;
-          ut_ad(&space == fil_system.sys_space);
-          const uint32_t size{node->size};
-          start+= size;
-          if (limit >= size)
-            limit-= size;
-          else
-            limit= 0;
-          node= next;
-          name= node->name;
-        }
-      }
-      else
-      {
-        for (;;)
-        {
-          if ((res= stream(sink.stream, node, name, start, limit)))
-            break;
-          fil_node_t *next= UT_LIST_GET_NEXT(chain, node);
-          if (!next)
-            break;
-          ut_ad(&space == fil_system.sys_space);
-          const uint32_t size{node->size};
-          start+= size;
-          if (limit >= size)
-            limit-= size;
-          else
-            limit= 0;
-          node= next;
-          name= node->name;
-        }
-      }
-#else
       else
       {
         int (*method)(const backup_target &, const backup_sink &,
                       fil_node_t *, const char *, uint32_t, uint32_t)
         { sink.stream == sink.NO_STREAM ? backup : stream };
-# ifdef HAVE_POSIX_FALLOCATE
+#ifdef HAVE_POSIX_FALLOCATE
         if (limit & 3 && !UT_LIST_GET_NEXT(chain, node))
         {
           const uint32_t page_size{space.physical_size()};
@@ -1734,7 +1692,7 @@ private:
               std::min(limit,
                        uint32_t(os_file_get_size(node->handle) / page_size));
         }
-# endif
+#endif
         for (;;)
         {
           cache_friendly(node->handle);
@@ -1763,7 +1721,7 @@ private:
           name= node->name;
         }
       }
-#endif
+
       mysql_mutex_lock(&fil_system.mutex);
       node->clear_backup_name();
       mysql_mutex_unlock(&fil_system.mutex);
