@@ -250,7 +250,7 @@ static int pread_write(IF_WIN(native_file_handle, int) in_fd,
     }
     if (ret < 0)
     {
-      /* pread(), pwrite() or backup_stream_write() failed */
+      /* pread(), pwrite() or backup_sink::write() failed */
       IF_WIN(my_osmaperr(GetLastError()),);
       break;
     }
@@ -341,10 +341,8 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
     }
 
     ret= !GetFileSizeEx(src, &li) ||
-      backup_stream_start(dst, path + dir_prefix, 0644, li.QuadPart,
-                          NULL, 0) ||
-      backup::append(src, dst, 0, li.QuadPart) ||
-      backup_stream_zeropad(dst, (size_t) li.QuadPart);
+      sink.create_file(path + dir_prefix, 0644, li.QuadPart, nullptr, 0) ||
+      sink.append(src, 0, li.QuadPart) || sink.zeropad(size_t(li.QuadPart));
     (void) CloseHandle(src);
 
     if (ret)
@@ -354,18 +352,6 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
     }
   }
   return ret;
-}
-
-int append(my_native_file src, my_native_file stream,
-           uint64_t start, uint64_t end) noexcept
-{
-  return append(native_file_handle{src}, stream, start, end);
-}
-
-int append(native_file_handle src, my_native_file stream,
-           uint64_t start, uint64_t end) noexcept
-{
-  return pread_write<true>(src, stream, start, end);
 }
 #else
 /**
@@ -417,6 +403,7 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
   return copy_or_stream(target, sink,
                         open(path, O_RDONLY), path + dir_prefix);
 }
+#endif
 
 }
 
@@ -432,60 +419,41 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
    @return error code (non-positive)
    @retval 0   on success
 */
-int backup_sink::append(int src, uint64_t start, uint64_t end) const noexcept
+int backup_sink::append(IF_WIN(native_file_handle,int) src,
+                        uint64_t start, uint64_t end) const noexcept
 {
-  assert(stream != NO_STREAM);
-  assert(end >= start);
-# if 0 /* On Linux, this turned out to be slower in our tests! */
-  /*
-    It is unsafe to zero-copy send from src unless we can guarantee
-    that the receiving end of the pipe has consumed everything before
-    our caller re-enables writes to this src region.
-
-    For Linux mmap(2), even for MAP_PRIVATE, the following is documented:
-    It is unspecified whether changes made to the file after the
-    mmap(2) call are visible in the mapped region.
-
-    Similarly, for Linux sendfile(2): If out_fd refers to a socket or
-    pipe with zero-copy support, callers must ensure the transferred
-    portions of the file referred to by in_fd remain unmodified until
-    the reader on the other end of out_fd has consumed the
-    transferred data.
-  */
-#  ifdef __linux__
-  const int pipe_size{fcntl(stream, F_GETPIPE_SZ)};
-#  elif defined __FreeBSD__ || defined __APPLE__
-  // https://unix.stackexchange.com/questions/11946/how-big-is-the-pipe-buffer
-  constexpr int pipe_size{65536};
-#  else
-  constexpr int pipe_size{0};
-#  endif
-  if (pipe_size > 0)
-  {
-    /*
-      It should be safe to invoke the zero-copy path if we can
-      guarantee that the recipient will drain the buffer before the
-      final nonzero-copy path completes. We assume that this is
-      guaranteed by writing at least pipe_size bytes via the
-      nonzero-copy path after this shortcut.
-    */
-    const uint64_t fast_end{start + uint64_t(pipe_size)};
-    if (fast_end < end)
-    {
-      if (int ret= append_async(src, start, fast_end))
-        return ret;
-      start= fast_end;
-    }
-  }
-# endif
   return pread_write<true>(src, stream, start, end);
 }
 
-# ifdef __linux__
+#ifdef _WIN32
+int backup_sink::append(my_native_file src,
+                        uint64_t start, uint64_t end) const noexcept
+{
+  return append(native_file_handle{src}, stream, start, end);
+}
+#elif defined __linux__
+/**
+   Zero-copy append an immutable file snippet to a stream.
+
+   The caller guarantees that this section of the file will remain
+   intact until the stream is closed. This guarantee is needed
+   because the receiving end of the stream pipe might delay consuming
+   the data, and the operating system might point the pipe buffer
+   to the block cache for a long time.
+
+   Note that tar uses 512-byte blocks. If end-start is not a multiple of
+   512 bytes, write() or zeropad() must be invoked afterwards.
+   @param src    file that will not be modified until the stream is closed
+   @param start  first offset to copy
+   @param end    first offset not to copy
+   @return error code (non-positive)
+   @retval 0   on success
+*/
 int backup_sink::append_async(int src, uint64_t start, uint64_t end)
   const noexcept
 {
   assert(stream != NO_STREAM);
+  assert(end >= start);
   for (off_t offset{off_t(start)};;)
   {
     const size_t c{size_t(std::min<off_t>(end - offset, INT_MAX >> 20 << 20))};
@@ -502,7 +470,6 @@ int backup_sink::append_async(int src, uint64_t start, uint64_t end)
       return -1;
   }
 }
-# endif
 #endif
 
 /**
