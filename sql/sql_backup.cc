@@ -429,7 +429,7 @@ int backup_sink::append(IF_WIN(native_file_handle,int) src,
 int backup_sink::append(my_native_file src,
                         uint64_t start, uint64_t end) const noexcept
 {
-  return append(native_file_handle{src}, stream, start, end);
+  return append(native_file_handle{src}, start, end);
 }
 #elif defined __linux__
 /**
