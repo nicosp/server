@@ -18,6 +18,10 @@
 #include <stdint.h>
 #include "my_sys.h"
 
+#ifdef _WIN32
+struct native_file_handle;
+#endif
+
 /** BACKUP SERVER target */
 struct backup_target
 {
@@ -189,9 +193,6 @@ struct backup_sink
 #endif
 };
 
-#ifdef _WIN32
-struct native_file_handle;
-#endif
 namespace backup {
 
 #ifdef _WIN32
