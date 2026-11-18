@@ -167,9 +167,7 @@ struct backup_sink
 #ifdef _WIN32
   int append(native_file_handle src, uint64_t start, uint64_t end)
     const noexcept;
-#endif
-
-#ifdef __linux__
+#elif defined __linux__
   /**
      Zero-copy append an immutable file snippet to a stream.
 
