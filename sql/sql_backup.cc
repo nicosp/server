@@ -242,7 +242,7 @@ static int pread_write(IF_WIN(native_file_handle, int) in_fd,
         while (size);
         assert(wo == o || ret < 0);
       }
-      else if (backup_stream_write(out_fd, b, size_t(ret)))
+      else if (backup_sink::write(out_fd, b, size_t(ret)))
       {
         ret= -1;
         break;
@@ -291,7 +291,7 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
                    const char *path, size_t dir_prefix) noexcept
 {
   int ret= -1;
-  if (sink.stream == INVALID_HANDLE_VALUE)
+  if (sink.stream == sink.NO_STREAM)
   {
     int len= snprintf(NULL, 0, "%s/%s", target.path, path + dir_prefix) + 1;
     char *dstpath= static_cast<char*>(malloc(len));
@@ -401,10 +401,9 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
   }
   else
   {
-    uint64_t end= (uint64_t) lseek(src, 0, SEEK_END);
-    ret= backup_stream_start(dst, path, 0644, end, NULL, 0) ||
-      backup::append(src, dst, 0, end) ||
-      backup_stream_zeropad(dst, (size_t) end);
+    uint64_t end= uint64_t(lseek(src, 0, SEEK_END));
+    ret= sink.create_file(path, 0644, end, NULL, 0) ||
+      sink.append(src, 0, end) || sink.zeropad(size_t(end));
     if (ret)
       goto write_error;
   }
@@ -419,22 +418,23 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
                         open(path, O_RDONLY), path + dir_prefix);
 }
 
+}
+
 /**
    Append a file snippet to stream,
-   after a corresponding call to backup_stream_start().
+   after a corresponding call to create_file().
 
    Note that tar uses 512-byte blocks. If end-start is not a multiple of
-   512 bytes, backup_stream_zeropad() must be invoked.
-   @param src      source file
-   @param stream   backup stream
+   512 bytes, write() or zeropad() must be invoked to pad the output.
+   @param src   source file
    @param start first offset to copy
-   @param end   last offset to copy (exclusive)
+   @param end   first offset not to copy
    @return error code (non-positive)
    @retval 0   on success
 */
-int append(int src, int stream, uint64_t start, uint64_t end) noexcept
+int backup_sink::append(int src, uint64_t start, uint64_t end) const noexcept
 {
-  assert(stream != backup_sink::NO_STREAM);
+  assert(stream != NO_STREAM);
   assert(end >= start);
 # if 0 /* On Linux, this turned out to be slower in our tests! */
   /*
@@ -472,7 +472,7 @@ int append(int src, int stream, uint64_t start, uint64_t end) noexcept
     const uint64_t fast_end{start + uint64_t(pipe_size)};
     if (fast_end < end)
     {
-      if (int ret= backup_stream_append_async(src, stream, start, fast_end))
+      if (int ret= append_async(src, start, fast_end))
         return ret;
       start= fast_end;
     }
@@ -482,9 +482,10 @@ int append(int src, int stream, uint64_t start, uint64_t end) noexcept
 }
 
 # ifdef __linux__
-int append_async(int src, int stream, uint64_t start, uint64_t end) noexcept
+int backup_sink::append_async(int src, uint64_t start, uint64_t end)
+  const noexcept
 {
-  assert(stream != backup_sink::NO_STREAM);
+  assert(stream != NO_STREAM);
   for (off_t offset{off_t(start)};;)
   {
     const size_t c{size_t(std::min<off_t>(end - offset, INT_MAX >> 20 << 20))};
@@ -504,21 +505,17 @@ int append_async(int src, int stream, uint64_t start, uint64_t end) noexcept
 # endif
 #endif
 
-}
-
 /**
    Zero-pad a the stream to a multiple of 512 bytes.
-
-   @param stream  backup stream
    @param written least significant bits of the number of payload appended
    @return error code (non-positive)
    @retval 0   on success
 */
-int backup_stream_zeropad(my_native_file stream, size_t written) noexcept
+int backup_sink::zeropad(size_t written) const noexcept
 {
   static constexpr const char zerobuf[511]{'\0'};
   written&= 511;
-  return written ? backup_stream_write(stream, zerobuf, 512 - written) : 0;
+  return written ? write(zerobuf, 512 - written) : 0;
 }
 
 /** Append to the configuration file.
@@ -531,42 +528,13 @@ int backup_target::config_append(const char *config, size_t size)
   const noexcept
 {
   /* FIXME: append to a pre-created configuration file */
-  auto dst= create_file("backup.cnf");
-
-#ifdef _WIN32
-  if (dst != INVALID_HANDLE_VALUE)
+  my_native_file dst{create_file("backup.cnf")};
+  if (IF_WIN(dst != INVALID_HANDLE_VALUE, dst >= 0))
   {
-    BOOL ok;
-    for (;;)
-    {
-      DWORD written;
-      ok= WriteFile(dst, config, DWORD(size), &written, nullptr);
-      if (ok || GetLastError() != ERROR_IO_PENDING)
-        break;
-      assert(written < DWORD(size));
-      config+= written;
-      size-= size_t(written);
-    }
-    if (CloseHandle(dst) & ok)
+    int err{backup_sink::write(dst, config, size)};
+    if (!(close(dst) | err))
       return 0;
   }
-#else
-  if (dst >= 0)
-  {
-    ssize_t ret;
-    for (; (ret= write(dst, config, size)) >= 0; config+= ret, size -= ret)
-    {
-      assert(size_t(ret) <= size);
-      if (!(size-= size_t(ret)))
-      {
-        ret= 0;
-        break;
-      }
-    }
-    if (!(close(dst) | ret))
-      return 0;
-  }
-#endif
   my_error(ER_CANT_CREATE_FILE, MYF(ME_ERROR_LOG), "backup.cnf", errno);
   return -1;
 }
@@ -1422,21 +1390,21 @@ static void ustar_block_checksum(char *buf) noexcept
 }
 
 /**
-   Write data to a stream.
-   @param stream  backup stream
+   Write data to a stream or a file.
+   @param dst     file or stream to write to
    @param buf     source buffer
-   @param size    length of the buffer (usually an integer multiple of 512)
+   @param size    length of the buffer
    @return error code (non-positive)
    @retval 0 on success
 */
-int backup_stream_write(my_native_file stream, const void *buf, size_t size)
+int backup_sink::write(my_native_file dst, const void *buf, size_t size)
   noexcept
 {
 #ifdef _WIN32
   for (DWORD sz= DWORD(size);;)
   {
     DWORD wrote;
-    if (WriteFile(stream, buf, sz, &wrote, nullptr))
+    if (WriteFile(dst, buf, sz, &wrote, nullptr))
     {
       assert(wrote == sz);
       return 0;
@@ -1452,7 +1420,7 @@ int backup_stream_write(my_native_file stream, const void *buf, size_t size)
 #else
   do
   {
-    ssize_t wrote= write(stream, buf, size);
+    ssize_t wrote= ::write(dst, buf, size);
     assert(wrote <= ssize_t(size));
     if (wrote < 0)
     {
@@ -1486,18 +1454,19 @@ static inline char *ustar_zeropad(char *b, const char *s, size_t size) noexcept
 #endif
 }
 
-/** Start streaming a file.
-@param stream   backup stream
-@param name     file name
-@param mode     file access mode
-@param size     physical length of the file, in bytes
-@param chunks   payload chunks of a sparse file, or nullptr
-@param n_chunks number of chunks; 0 unless sparse file
-@return error code (non-positive)
-@retval 0   on success */
-int backup_stream_start(my_native_file stream,
-                        const char *name, mode_t mode, uint64_t size,
-                        const backup_chunk *chunks, size_t n_chunks) noexcept
+/**
+   Start streaming a file.
+   @param name     file name
+   @param mode     file access mode
+   @param size     physical length of the file, in bytes
+   @param chunks   payload chunks of a sparse file, or nullptr
+   @param n_chunks number of chunks; 0 unless sparse file
+   @return error code (non-positive)
+   @retval 0   on success
+*/
+int backup_sink::create_file(const char *name, mode_t mode, uint64_t size,
+                             const backup_chunk *chunks, size_t n_chunks)
+  const noexcept
 {
 #ifndef NDEBUG
   if (size_t n{n_chunks})
@@ -1508,7 +1477,7 @@ int backup_stream_start(my_native_file stream,
     assert(!s);
   }
 #endif
-  assert(stream != backup_sink::NO_STREAM);
+  assert(stream != NO_STREAM);
   char buf[512];
   size_t s= strlen(name);
   if (s > 99)
@@ -1519,15 +1488,15 @@ int backup_stream_start(my_native_file stream,
     ustar_block_init(buf, "././@LongLink", 0644, s + 1);
     buf[156]= 'L';
     ustar_block_checksum(buf);
-    if (int err= backup_stream_write(stream, buf, sizeof buf))
+    if (int err= write(buf, sizeof buf))
       return err;
     const size_t whole{s & ~((sizeof buf) - 1)};
     if (whole)
-      if (int err= backup_stream_write(stream, name, whole))
+      if (int err= write(name, whole))
         return err;
     /* After 512*n bytes of file name there will be a zerofilled block. */
     ustar_zeropad(buf, name + whole, sizeof buf);
-    if (int err= backup_stream_write(stream, buf, sizeof buf))
+    if (int err= write(buf, sizeof buf))
       return err;
   }
 
@@ -1549,29 +1518,28 @@ int backup_stream_start(my_native_file stream,
                       chunks[n_chunks - 1].length);
   }
   ustar_block_checksum(buf);
-  return backup_stream_write(stream, buf, sizeof buf);
+  return write(buf, sizeof buf);
 }
 
-/** Append to the configuration file.
-@param target   backup stream
-@param config   the configuration file snippet to append
-@param size     length of the snippet
-@return error code (non-positive)
-@retval 0   on success */
-int backup_stream_config(my_native_file stream,
-                         const char *config, size_t size) noexcept
+/**
+   Append to the configuration file.
+   @param config   the configuration file snippet to append
+   @param size     length of the snippet
+   @return error code (non-positive)
+   @retval 0   on success
+*/
+int backup_sink::config_append(const char *config, size_t size) const noexcept
 {
   /* FIXME: append to a pre-created configuration file */
-  if (int ret=
-      backup_stream_start(stream, "backup.cnf", 0644, size, nullptr, 0))
+  if (int ret= create_file("backup.cnf", 0644, size, nullptr, 0))
     return ret;
   char buf[512];
   const size_t whole{size & ~((sizeof buf) - 1)};
   if (whole)
-    if (int err= backup_stream_write(stream, config, whole))
+    if (int err= write(config, whole))
       return err;
   if (size == whole)
     return 0;
   ustar_zeropad(buf, config + whole, sizeof buf);
-  return backup_stream_write(stream, buf, sizeof buf);
+  return write(buf, sizeof buf);
 }

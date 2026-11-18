@@ -111,7 +111,7 @@ static int backup_log_tail_clear(my_native_file log, uint64_t offset,
     return 0;
   if (backup_target::seek(log, offset + log_sys.START_OFFSET))
     return -1;
-  return backup_stream_write(log, field_ref_zero, bs_1 + 1 - o);
+  return backup_sink::write(log, field_ref_zero, bs_1 + 1 - o);
 }
 
 /** Associate a transaction with the current session
@@ -1677,7 +1677,7 @@ private:
       {
         for (;;)
         {
-          if ((res= backup(target.path, node, name, start, limit)))
+          if ((res= backup(target, sink, node, name, start, limit)))
             break;
           fil_node_t *next= UT_LIST_GET_NEXT(chain, node);
           if (!next)
@@ -1716,15 +1716,9 @@ private:
 #else
       else
       {
-        int fd= sink.stream;
-        int (*method)(int, fil_node_t *, const char *, uint32_t, uint32_t);
-        if (fd == sink.NO_STREAM)
-        {
-          fd= target.fd;
-          method= backup;
-        }
-        else
-          method= stream;
+        int (*method)(const backup_target &, const backup_sink &,
+                      fil_node_t *, const char *, uint32_t, uint32_t)
+        { sink.stream == sink.NO_STREAM ? backup : stream };
 # ifdef HAVE_POSIX_FALLOCATE
         if (limit & 3 && !UT_LIST_GET_NEXT(chain, node))
         {
@@ -1748,7 +1742,7 @@ private:
           std::ignore=
             posix_fadvise(node->handle, 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
-          res= (*method)(fd, node, name, start, limit);
+          res= (*method)(target, sink, node, name, start, limit);
 #ifdef POSIX_FADV_NORMAL
           std::ignore=
             posix_fadvise(node->handle, 0, 0, POSIX_FADV_NORMAL);
@@ -1902,13 +1896,14 @@ private:
      @return error code (non-positive)
      @retval 0 on success
   */
-  static int backup(IF_WIN(const char *,int) target, fil_node_t *node,
+  static int backup(const backup_target &target, const backup_sink &,
+                    fil_node_t *node,
                     const char *name,
                     uint32_t start, uint32_t limit) noexcept;
 
   /**
      Stream a persistent InnoDB data file.
-     @param stream backup target stream
+     @param sink   backup target stream
      @param node   InnoDB data file
      @param name   node->name at init()
      @param start  the page number at the start of the file
@@ -1916,8 +1911,8 @@ private:
      @return error code (non-positive)
      @retval 0 on success
   */
-  static int stream(my_native_file stream, fil_node_t *node,
-                    const char *name,
+  static int stream(const backup_target&, const backup_sink &sink,
+                    fil_node_t *node, const char *name,
                     uint32_t start, uint32_t limit) noexcept;
 
 private:
@@ -1945,7 +1940,7 @@ private:
     write_checkpoint_buf(buf, c + log_sys.START_OFFSET);
     if (backup_target::seek(dst, 0))
       return -1;
-    return backup_stream_write(dst, buf, sizeof buf);
+    return backup_sink::write(dst, buf, sizeof buf);
   }
 
 public:
@@ -2021,7 +2016,7 @@ public:
     ut_ad(size <= CONFIG_SIZE);
     return sink.stream == sink.NO_STREAM
       ? target.config_append(config, size)
-      : backup_stream_config(sink.stream, config, size);
+      : sink.config_append(config, size);
   }
 
   /**
@@ -2269,21 +2264,20 @@ public:
       ut_ad(!!c == (size_t(chunk - chunks) & 1));
       const size_t cp_size= (!!c) << 9;
       err=
-        backup_stream_start(dst, basename,
-                            mode_t(0444 | int{lsn == ctx.max_first_lsn} << 7),
-                            end.length + cp_size, chunks, chunk - chunks);
+        sink.create_file(basename,
+                         mode_t(0444 | int{lsn == ctx.max_first_lsn} << 7),
+                         end.length + cp_size, chunks, chunk - chunks);
       if (!err && cp_size)
       {
         uint64_t cp_buf[8]{};
         write_checkpoint_buf(cp_buf, c);
-        err= backup_stream_write(dst, cp_buf, sizeof cp_buf) ||
-          backup_stream_write(dst, field_ref_zero, cp_size - sizeof cp_buf);
+        err= sink.write(cp_buf, sizeof cp_buf) ||
+          sink.write(field_ref_zero, cp_size - sizeof cp_buf);
       }
       if (!err)
       {
-        err= backup::append_async(src, dst, end.offset,
-                                  end.offset + end.length) ||
-          backup_stream_zeropad(dst, size_t(end.length));
+        err= sink.append_async(src, end.offset, end.offset + end.length) ||
+          sink.zeropad(size_t(end.length));
       }
     }
     else
@@ -2383,14 +2377,14 @@ int InnoDB_backup::clone_file_try(int dst, fil_node_t *node,
 }
 #endif
 
-int InnoDB_backup::backup(IF_WIN(const char *,int) target, fil_node_t *node,
-                          const char *name,
+int InnoDB_backup::backup(const backup_target &target, const backup_sink &,
+                          fil_node_t *node, const char *name,
                           uint32_t start, uint32_t limit) noexcept try
 {
   for (bool tried_mkdir{false};;)
   {
 #ifdef _WIN32
-    std::string path{target};
+    std::string path{target.path};
     path.push_back('/');
     path.append(name);
     HANDLE f=
@@ -2424,7 +2418,7 @@ int InnoDB_backup::backup(IF_WIN(const char *,int) target, fil_node_t *node,
     this assumption be invalid, some data files in the backup may be
     corrupted. This corruption can be fixed by either removing this
     special handling, or by implementing file-level locking. */
-    f= fclonefileat(node->handle, target, name, 0);
+    f= fclonefileat(node->handle, target.fd, name, 0);
     if (!f)
       break;
     switch (errno) {
@@ -2448,11 +2442,11 @@ int InnoDB_backup::backup(IF_WIN(const char *,int) target, fil_node_t *node,
       switch (FSP_FLAGS_GET_ZIP_SSIZE(node->space->flags)) {
       case 1: /* 1024 bytes */
       case 2: /* 2048 bytes */
-        f= backup_file_create_buffered(target, name);
+        f= backup_file_create_buffered(target.fd, name);
         continue;
       }
 # endif
-      f= backup_file_create(target, name);
+      f= backup_file_create(target.fd, name);
     }
     while (false);
 
@@ -2472,7 +2466,7 @@ int InnoDB_backup::backup(IF_WIN(const char *,int) target, fil_node_t *node,
           sep= strchr(sep + 1, '/');
           ut_ad(sep);
           std::string dir{name, size_t(sep - name)};
-          if (!mkdirat(target, dir.c_str(), 0777) || errno == EEXIST)
+          if (!mkdirat(target.fd, dir.c_str(), 0777) || errno == EEXIST)
             continue;
         }
       }
@@ -2561,12 +2555,12 @@ int InnoDB_backup::backup(IF_WIN(const char *,int) target, fil_node_t *node,
       }
     }
 
-    if (IF_WIN(!CloseHandle,close)(f) | err)
+    if (target.close(f) | err)
     {
       if (err != 2)
         goto fail;
       /* The tablespace is being dropped. */
-      IF_WIN(DeleteFile(path.c_str()), unlinkat(target, name, 0));
+      IF_WIN(DeleteFile(path.c_str()), unlinkat(target.fd, name, 0));
     }
 
     break;
@@ -2582,8 +2576,8 @@ catch (std::bad_alloc&)
   return -1;
 }
 
-int InnoDB_backup::stream(my_native_file stream, fil_node_t *node,
-                          const char *name,
+int InnoDB_backup::stream(const backup_target &, const backup_sink &sink,
+                          fil_node_t *node, const char *name,
                           uint32_t start, uint32_t limit) noexcept
 {
   const uint32_t page_size{node->space->physical_size()},
@@ -2633,11 +2627,9 @@ loop:
     if (end)
     {
       if (page ||
-          !(err= backup_stream_start(stream, name, 0644,
-                                     physical_size, chunk, n_chunk)))
-        err= backup::append(node->handle, stream,
-                            uint64_t{page} * page_size,
-                            uint64_t{last} * page_size);
+          !(err= sink.create_file(name, 0644, physical_size, chunk, n_chunk)))
+        err= sink.append(node->handle, uint64_t{page} * page_size,
+                         uint64_t{last} * page_size);
     }
     else
     {
@@ -2652,7 +2644,7 @@ loop:
         do
         {
           const size_t s= size < uint64_t{sz} ? size_t(size) : sz;
-          err= backup_stream_write(stream, zerofill, s);
+          err= sink.write(zerofill, s);
           size-= s;
         }
         while (!err && size);

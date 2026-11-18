@@ -3857,7 +3857,7 @@ static int maria_backup_create(const backup_target &target,
 {
   *dst= sink.stream;
   if (*dst != backup_sink::NO_STREAM)
-    return backup_stream_start(*dst, name, 0644, size, nullptr, 0);
+    return sink.create_file(name, 0644, size, nullptr, 0);
   *dst= target.create_file(name);
   return *dst == backup_sink::NO_STREAM;
 }
@@ -3938,13 +3938,13 @@ static bool maria_backup_copy(const backup_target &target,
       read_failed= true;
       break;
     }
-    err= backup_stream_write(dst, buf, size_t(n));
+    err= backup_sink::write(dst, buf, size_t(n));
     pos+= my_off_t(n);
   }
 
   if (sink.stream != backup_sink::NO_STREAM)
-    err= err || read_failed || backup_stream_zeropad(dst, size_t(size));
-  else if (IF_WIN(!CloseHandle(dst), close(dst)))
+    err= err || read_failed || sink.zeropad(size_t(size));
+  else if (target.close(dst))
   {
     IF_WIN(my_osmaperr(GetLastError()),);
     err= -1;
@@ -4093,9 +4093,9 @@ static bool maria_backup_log_tail(const backup_target &target,
 
   if (dst != sink.NO_STREAM)
   {
-    err= backup_stream_start(dst, name, 0644, size, nullptr, 0);
+    err= sink.create_file(name, 0644, size, nullptr, 0);
     if (!err)
-      err= backup::append(src, dst, 0, clone_size);
+      err= sink.append(src, 0, clone_size);
   }
   else
   {
@@ -4111,7 +4111,7 @@ static bool maria_backup_log_tail(const backup_target &target,
   if (buf)
   {
     if (!err)
-      err= backup_stream_write(dst, buf, TRANSLOG_PAGE_SIZE);
+      err= sink.write(dst, buf, TRANSLOG_PAGE_SIZE);
     aligned_free(buf);
   }
   if (sink.stream == backup_sink::NO_STREAM && target.close(dst))
@@ -4167,12 +4167,12 @@ static bool maria_backup_control_file(const backup_target &target,
   {
     /* Write the image followed by zero padding to a 512-byte block */
     bzero(buf + size, sizeof buf - size);
-    err= err || backup_stream_write(dst, buf, sizeof buf);
+    err= err || sink.write(buf, sizeof buf);
   }
   else
   {
-    err= backup_stream_write(dst, buf, size);
-    err|= IF_WIN(!CloseHandle(dst), close(dst));
+    err= sink.write(dst, buf, size);
+    err|= target.close(dst);
   }
   if (!err)
     return false;

@@ -75,6 +75,15 @@ struct backup_target
   int config_append(const char *config, size_t size) const noexcept;
 };
 
+/** A payload chunk in a sparse file that is being streamed */
+struct backup_chunk
+{
+  /** byte offset of the start of the payload, from the start of the file */
+  uint64_t offset;
+  /** length of the hole */
+  uint64_t length;
+};
+
 /** BACKUP SERVER worker specific context */
 struct backup_sink
 {
@@ -86,15 +95,98 @@ struct backup_sink
   my_native_file stream;
   /** storage engine context returned by handlerton::backup_start() */
   void *ha_data;
-};
 
-/** A payload chunk in a sparse file that is being streamed */
-struct backup_chunk
-{
-  /** byte offset of the start of the payload, from the start of the file */
-  uint64_t offset;
-  /** length of the hole */
-  uint64_t length;
+  /**
+     Append to the configuration file.
+     @param config   the configuration file snippet to append
+     @param size     length of the snippet
+     @return error code (non-positive)
+     @retval 0   on success
+  */
+  int config_append(const char *config, size_t size) const noexcept;
+
+  /**
+     Start streaming a file.
+     @param name     file name
+     @param mode     file access mode
+     @param size     physical length of the file, in bytes
+     @param chunks   payload chunks of a sparse file, or nullptr
+     @param n_chunks number of chunks; 0 unless sparse file
+     @return error code (non-positive)
+     @retval 0   on success
+  */
+  int create_file(const char *name, mode_t mode, uint64_t size,
+                  const backup_chunk *chunks, size_t n_chunks) const noexcept;
+
+  /**
+     Write data to a stream or a file.
+     @param dst     file or stream to write to
+     @param buf     source buffer
+     @param size    length of the buffer
+     @return error code (non-positive)
+     @retval 0 on success
+  */
+  static int write(my_native_file dst, const void *buf, size_t size) noexcept;
+
+  /**
+     Write data to a stream.
+     @param buf     source buffer
+     @param size    length of the buffer (usually an integer multiple of 512)
+     @return error code (non-positive)
+     @retval 0 on success
+  */
+  int write(const void *buf, size_t size) const noexcept
+  { return write(stream, buf, size); }
+
+  /**
+     Zero-pad a the stream to a multiple of 512 bytes.
+     @param written least significant bits of the number of payload appended
+     @return error code (non-positive)
+     @retval 0   on success
+  */
+  int zeropad(size_t written) const noexcept;
+
+  /**
+     Append a file snippet to the stream,
+     after a corresponding call to create_file().
+
+     Note that tar uses 512-byte blocks. If end-start is not a multiple of
+     512 bytes, write() or zeropad() must be invoked to pad the output.
+     @param src    source file
+     @param start  first offset to copy
+     @param end    first offset not to copy
+     @return error code (non-positive)
+     @retval 0   on success
+  */
+  int append(my_native_file src, uint64_t start, uint64_t end) const noexcept;
+
+#ifdef _WIN32
+  int append(native_file_handle src, uint64_t start, uint64_t end)
+    const noexcept;
+#endif
+
+#ifdef __linux__
+  /**
+     Zero-copy append an immutable file snippet to a stream.
+
+     The caller guarantees that this section of the file will remain
+     intact until the stream is closed. This guarantee is needed
+     because the receiving end of the stream pipe might delay consuming
+     the data, and the operating system might point the pipe buffer
+     to the block cache for a long time.
+
+     Note that tar uses 512-byte blocks. If end-start is not a multiple of
+     512 bytes, write() or zeropad() must be invoked afterwards.
+     @param src    file that will not be modified until the stream is closed
+     @param start  first offset to copy
+     @param end    first offset not to copy
+     @return error code (non-positive)
+     @retval 0   on success
+  */
+  int append_async(int src, uint64_t start, uint64_t end) const noexcept;
+#else
+# define append_async(src,start,end) append(src,start,end)
+#endif
 };
 
 #ifdef _WIN32
@@ -108,7 +200,7 @@ namespace backup {
    @param src   source file descriptor
    @param dst   target to append src to
    @param start first offset to copy
-   @param end   last offset to copy (exclusive)
+   @param end   first offset not to copy
    @return error code (non-positive)
    @retval 0   on success
 */
@@ -143,91 +235,4 @@ int copy_or_stream(const backup_target &target, const backup_sink &sink,
 int copy_or_stream(const backup_target &target, const backup_sink &sink,
                    const char *path, size_t dir_prefix= 0) noexcept;
 
-/**
-   Append a file snippet to the stream,
-   after a corresponding call to backup_stream_start().
-
-   Note that tar uses 512-byte blocks. If end-start is not a multiple of
-   512 bytes, backup_stream_write() must be invoked to zero-pad the output.
-   @param src    source file
-   @param stream backup stream
-   @param start  first offset to copy
-   @param end    last offset to copy (exclusive)
-   @return error code (non-positive)
-   @retval 0   on success
-*/
-int append(my_native_file src, my_native_file stream,
-           uint64_t start, uint64_t end) noexcept;
-
-#ifdef _WIN32
-int append(native_file_handle src, my_native_file stream,
-           uint64_t start, uint64_t end) noexcept;
-#endif
-
-#ifdef __linux__
-/**
-   Zero-copy append an immutable file snippet to a stream.
-
-   The caller guarantees that this section of the file will remain
-   intact until the stream is closed. This guarantee is needed
-   because the receiving end of the stream pipe might delay consuming
-   the data, and the operating system might point the pipe buffer
-   to the block cache for a long time.
-
-   Note that tar uses 512-byte blocks. If end-start is not a multiple of
-   512 bytes, backup_stream_zeropad() must be invoked.
-   @param src    source file that will not be modified until stream is closed
-   @param stream backup stream
-   @param start  first offset to copy
-   @param end    first offset not to copy
-   @return error code (non-positive)
-   @retval 0   on success
-*/
-int append_async(int src, int stream, uint64_t start, uint64_t end) noexcept;
-#else
-# define append_async(src,stream,start,end) append(src,stream,start,end)
-#endif
 }
-
-/** Append to the configuration file.
-@param target   backup stream
-@param config   the configuration file snippet to append
-@param size     length of the snippet
-@return error code (non-positive)
-@retval 0   on success */
-int backup_stream_config(my_native_file stream, const char *config,
-                         size_t size) noexcept;
-
-/** Start streaming a file.
-@param target   backup target
-@param name     file name
-@param mode     file access mode
-@param size     physical length of the file, in bytes
-@param chunks   payload chunks of a sparse file, or nullptr
-@param n_chunks number of chunks; 0 unless sparse file
-@return error code (non-positive)
-@retval 0   on success */
-int backup_stream_start(my_native_file stream,
-                        const char *name, mode_t mode, uint64_t size,
-                        const backup_chunk *chunks, size_t n_chunks) noexcept;
-
-/**
-   Write data to a stream.
-   @param stream  backup stream
-   @param buf     source buffer
-   @param size    length of the buffer (usually an integer multiple of 512)
-   @return error code (non-positive)
-   @retval 0 on success
-*/
-int backup_stream_write(my_native_file stream, const void *buf, size_t size)
-  noexcept;
-
-/**
-   Zero-pad a the stream to a multiple of 512 bytes.
-
-   @param stream  backup stream
-   @param written least significant bits of the number of payload appended
-   @return error code (non-positive)
-   @retval 0   on success
-*/
-int backup_stream_zeropad(my_native_file stream, size_t written) noexcept;
