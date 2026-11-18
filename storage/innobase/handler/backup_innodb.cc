@@ -2281,8 +2281,8 @@ public:
       }
       if (!err)
       {
-        err= backup_stream_append_async(src, dst, end.offset,
-                                        end.offset + end.length) ||
+        err= backup::append_async(src, dst, end.offset,
+                                  end.offset + end.length) ||
           backup_stream_zeropad(dst, size_t(end.length));
       }
     }

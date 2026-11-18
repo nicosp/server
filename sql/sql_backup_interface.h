@@ -103,8 +103,6 @@ struct native_file_handle;
 namespace backup {
 
 #ifdef _WIN32
-typedef native_file_handle handle;
-
 /**
    Copy a portion of a file.
    @param src   source file descriptor
@@ -116,7 +114,6 @@ typedef native_file_handle handle;
 */
 int copy(native_file_handle src, HANDLE dst, uint64_t start, uint64_t end)
   noexcept;
-
 #else
 inline int copy(int src, int dst, uint64_t start, uint64_t end) noexcept
 { return my_copy_file_range(src, dst, start, end); }
@@ -166,6 +163,30 @@ int append(my_native_file src, my_native_file stream,
 int append(native_file_handle src, my_native_file stream,
            uint64_t start, uint64_t end) noexcept;
 #endif
+
+#ifdef __linux__
+/**
+   Zero-copy append an immutable file snippet to a stream.
+
+   The caller guarantees that this section of the file will remain
+   intact until the stream is closed. This guarantee is needed
+   because the receiving end of the stream pipe might delay consuming
+   the data, and the operating system might point the pipe buffer
+   to the block cache for a long time.
+
+   Note that tar uses 512-byte blocks. If end-start is not a multiple of
+   512 bytes, backup_stream_zeropad() must be invoked.
+   @param src    source file that will not be modified until stream is closed
+   @param stream backup stream
+   @param start  first offset to copy
+   @param end    first offset not to copy
+   @return error code (non-positive)
+   @retval 0   on success
+*/
+int append_async(int src, int stream, uint64_t start, uint64_t end) noexcept;
+#else
+# define append_async(src,stream,start,end) append(src,stream,start,end)
+#endif
 }
 
 /** Append to the configuration file.
@@ -210,28 +231,3 @@ int backup_stream_write(my_native_file stream, const void *buf, size_t size)
    @retval 0   on success
 */
 int backup_stream_zeropad(my_native_file stream, size_t written) noexcept;
-
-#ifdef _WIN32
-# define backup_stream_append_async backup::append
-#else
-/**
-   Zero-copy append an immutable file snippet to a stream.
-
-   The caller guarantees that this section of the file will remain
-   intact until the stream is closed. This guarantee is needed
-   because the receiving end of the stream pipe might delay consuming
-   the data, and the operating system might point the pipe buffer
-   to the block cache for a long time.
-
-   Note that tar uses 512-byte blocks. If end-start is not a multiple of
-   512 bytes, backup_stream_zeropad() must be invoked.
-   @param src    source file
-   @param stream backup stream
-   @param start  first offset to copy
-   @param end    last offset to copy (exclusive)
-   @return error code (non-positive)
-   @retval 0   on success
-*/
-int backup_stream_append_async(int src, int stream,
-                               uint64_t start, uint64_t end) noexcept;
-#endif

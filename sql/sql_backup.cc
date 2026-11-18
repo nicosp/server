@@ -480,6 +480,28 @@ int append(int src, int stream, uint64_t start, uint64_t end) noexcept
 # endif
   return pread_write<true>(src, stream, start, end);
 }
+
+# ifdef __linux__
+int append_async(int src, int stream, uint64_t start, uint64_t end) noexcept
+{
+  assert(stream != backup_sink::NO_STREAM);
+  for (off_t offset{off_t(start)};;)
+  {
+    const size_t c{size_t(std::min<off_t>(end - offset, INT_MAX >> 20 << 20))};
+    ssize_t ret{sendfile(stream, src, &offset, c)};
+    if (ret < 0)
+    {
+      if (errno == EAGAIN)
+        continue;
+      return int(ret);
+    }
+    if (offset == off_t(end))
+      return 0;
+    if (!ret)
+      return -1;
+  }
+}
+# endif
 #endif
 
 }
@@ -1553,48 +1575,3 @@ int backup_stream_config(my_native_file stream,
   ustar_zeropad(buf, config + whole, sizeof buf);
   return backup_stream_write(stream, buf, sizeof buf);
 }
-
-#ifndef _WIN32
-/**
-   Zero-copy append an immutable file snippet to a stream.
-
-   The caller guarantees that this section of the file will remain
-   intact until the stream is closed. This guarantee is needed
-   because the receiving end of the stream pipe might delay consuming
-   the data, and the operating system might point the pipe buffer
-   to the block cache for a long time.
-
-   Note that tar uses 512-byte blocks. If end-start is not a multiple of
-   512 bytes, backup_stream_zeropad() must be invoked.
-   @param src    source file
-   @param stream backup stream
-   @param start  first offset to copy
-   @param end    last offset to copy (exclusive)
-   @return error code (non-positive)
-   @retval 0   on success
-*/
-int backup_stream_append_async(int src, int stream,
-                               uint64_t start, uint64_t end) noexcept
-{
-  assert(stream != backup_sink::NO_STREAM);
-# ifdef __linux__
-  for (off_t offset{off_t(start)};;)
-  {
-    const size_t c{size_t(std::min<off_t>(end - offset, INT_MAX >> 20 << 20))};
-    ssize_t ret= sendfile(stream, src, &offset, c);
-    if (ret < 0)
-    {
-      if (errno == EAGAIN)
-        continue;
-      return int(ret);
-    }
-    if (offset == off_t(end))
-      return 0;
-    if (!ret)
-      return -1;
-  }
-# else
-  return pread_write<true>(src, stream, start, end);
-# endif
-}
-#endif
